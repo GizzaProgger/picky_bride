@@ -2,9 +2,18 @@ import express from "express";
 import mysql from "mysql2/promise";
 import moment from "moment";
 import algorithm from "./js/algorithm.js";
+import cors from "cors";
+import bodyParser from "body-parser";
 
 const app = express();
-
+app.use(bodyParser.json()); // to support JSON-encoded bodies
+app.use(
+  bodyParser.urlencoded({
+    // to support URL-encoded bodies
+    extended: true,
+  })
+);
+app.use(cors());
 (async () => {
   const connection = await mysql.createConnection({
     host: "localhost",
@@ -35,6 +44,17 @@ const app = express();
     );
   });
 
+  app.get("/resultBetweenDates", async (req, res) => {
+    if (!req.query.start || !req.query.end) return res.json({ error: true });
+    return res.json({
+      success: true,
+      data: await driver.getResult({
+        start: req.query.start,
+        end: req.query.end,
+      }),
+    });
+  });
+
   app.post("/result", async (req, res) => {
     console.log(req.query);
     return res.json(
@@ -49,6 +69,14 @@ const app = express();
   });
 
   const simulate = async ({ start, maxBuyDate, maxSaleDate }) => {
+    if (start - maxBuyDate > 86400000 * 7)
+      return console.error(
+        "Дата начала покупки должна быть раньше даты крайнер даты покупки минимум на 7 суток"
+      );
+    if (maxBuyDate - maxSaleDate > 86400000 * 7)
+      return console.error(
+        "Дата крайней покупки должна быть раньше даты крайней продажи минимум на 7 суток"
+      );
     const currencycBuyed = await driver.getCurrencyFromPeriod({
       start,
       end: maxBuyDate,
@@ -61,19 +89,31 @@ const app = express();
     const maxIndexSale = algorithm(currencycSeled.map((v) => v.value));
     const maxSale = currencycSeled[maxIndexSale];
     const buyed = currencycBuyed[maxIndexBuy];
-    if (!maxSale.value || !buyed.value)
-      return console.error(
-        "Error",
-        `max index sale ${maxIndexSale}`,
-        `max index buyed ${buyed}`,
-        `array sales length ${currencycSeled}`,
-        `array buyed length ${currencycBuyed}`
-      );
+    if (!maxSale?.value || !buyed?.value)
+      return new Promise((res, rej) => {
+        console.error(
+          "Error \n",
+          `max index sale ${maxIndexSale} \n`,
+          `max index buyed ${maxIndexBuy} \n`,
+          `array sales length ${currencycSeled.length} \n`,
+          `array buyed length ${currencycBuyed.length} \n`
+        );
+      });
     const absDiff = maxSale.value - buyed.value;
+    const bestBuy = Math.min.apply(
+      Math,
+      currencycBuyed.map((c) => c.value)
+    );
+    const bestSale = Math.max.apply(
+      Math,
+      currencycSeled.map((c) => c.value)
+    );
     const result = {
       buy: currencycBuyed[maxIndexBuy],
       sale: currencycSeled[maxIndexSale],
       diff: absDiff / currencycBuyed[maxIndexBuy].value,
+      bestBuy,
+      bestSale,
     };
     driver.addResult({
       result: 1 + result.diff,
@@ -81,21 +121,24 @@ const app = express();
       saleDate: +new Date(result.sale.date),
       startDate: start,
       endDate: maxSaleDate,
+      bestBuy,
+      bestSale,
     });
     return result;
   };
 
-  app.post("/sumulation", async (req, res) => {
-    return res.json(
-      await simulate({
-        start: req.query.start,
-        maxBuyDate: req.query.maxBuyDate,
-        maxSaleDate: req.query.maxSaleDate,
-      })
-    );
+  app.post("/simulation", async (req, res) => {
+    return res.json({
+      success: true,
+      result: await simulate({
+        start: parseInt(req.body.start),
+        maxBuyDate: parseInt(req.body.maxBuyDate),
+        maxSaleDate: parseInt(req.body.maxSaleDate),
+      }),
+    });
   });
 
-  app.post("/sumulationsRandom", async (req, res) => {
+  app.post("/simulationsRandom", async (req, res) => {
     const getRandomInt = (min, max) => {
       min = Math.ceil(min);
       max = Math.floor(max);
@@ -111,8 +154,14 @@ const app = express();
         const minDate = 883612800000;
         let lastHistoryDate = 1638326762000;
         let start = getRandomValueBetween(minDate, lastHistoryDate);
-        let maxBuyDate = getRandomValueBetween(start, lastHistoryDate);
-        let maxSaleDate = getRandomValueBetween(maxBuyDate, lastHistoryDate);
+        let maxBuyDate = getRandomValueBetween(
+          start + 86400000 * 7,
+          lastHistoryDate
+        );
+        let maxSaleDate = getRandomValueBetween(
+          maxBuyDate + 86400000 * 7,
+          lastHistoryDate
+        );
         return simulate({
           start,
           maxBuyDate,
@@ -120,7 +169,12 @@ const app = express();
         });
       });
     await Promise.all(promises);
-    res.json({ success: true });
+    res.json({
+      success: true,
+      data: {
+        msg: `Симуляция завершена успешно. Количество итераций - ${req.query.n}`,
+      },
+    });
   });
 })();
 
@@ -153,12 +207,28 @@ const driverFactory = (connection) => {
       `);
       return rows;
     },
-    async addResult({ result, buyDate, saleDate, startDate, endDate }) {
+    async addResult({
+      result,
+      buyDate,
+      saleDate,
+      startDate,
+      endDate,
+      bestBuy,
+      bestSale,
+    }) {
       const q = `
-      INSERT INTO results (currency_id, result, buy_date, sale_date, start_date, end_date) VALUES (0, ${result}, '${d(
+      INSERT INTO results (currency_id, result, buy_date, sale_date, start_date, end_date, best_buy, best_sale, simulation_date) VALUES (0, ${result}, '${d(
         buyDate
-      )}', '${d(saleDate)}', '${d(startDate)}', '${d(endDate)}')
+      )}', '${d(saleDate)}', '${d(startDate)}', '${d(
+        endDate
+      )}', ${bestBuy}, ${bestSale}, '${d(+new Date())}')
     `;
+      return connection.query(q);
+    },
+    async getResult({ start, end }) {
+      const q = `SELECT * FROM results WHERE date BETWEEN ${d(start)} AND ${d(
+        end
+      )}`;
       return connection.query(q);
     },
   };
